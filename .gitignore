@@ -1,0 +1,4 @@
+build/
+chat_server
+*.o
+*.db

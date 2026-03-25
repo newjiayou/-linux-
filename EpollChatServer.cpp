@@ -13,8 +13,7 @@
 
 // 构造函数，初始化线程池（假设开4个工作线程）
 EpollChatServer::EpollChatServer(uint16_t port) 
-    : m_port(port), m_listenFd(-1), m_epollFd(-1), m_threadPool(4) {}
-
+    : m_port(port), m_listenFd(-1), m_epollFd(-1), m_threadPool(4), m_mysql(nullptr) {}
 EpollChatServer::~EpollChatServer() {
     if (m_listenFd != -1) close(m_listenFd);
     if (m_epollFd != -1) close(m_epollFd);
@@ -49,6 +48,7 @@ std::string EpollChatServer::extractJsonValue(const std::string& json, const std
 }
 
 bool EpollChatServer::start() {
+    if (!initDB()) return false; // 初始化数据库
     m_listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (m_listenFd < 0) return false;
 
@@ -168,6 +168,8 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
     int clientFd = ctx->fd;
 
     if (msgType == 3) {
+
+        
         std::string senderID = extractJsonValue(body, "sender");
         if (!senderID.empty()) {
             std::lock_guard<std::mutex> lock(m_mapMutex);
@@ -179,7 +181,9 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
     else if (msgType == 1) {
         std::string senderID = extractJsonValue(body, "sender");
         std::string target = extractJsonValue(body, "target");
-
+        std::string content = extractJsonValue(body, "content"); 
+        log(senderID+target+content) ;
+        saveMessageToDB(senderID, target, content);
         if (target == "broadcast") {
             std::vector<int> targetFds;
             {
@@ -265,4 +269,32 @@ void EpollChatServer::handleDisconnect(int fd) {
     epoll_ctl(m_epollFd, EPOLL_CTL_DEL, fd, nullptr);
     close(fd);
     log("当前在线连接数: " + std::to_string(currentCount));
+}
+
+bool EpollChatServer::initDB() {
+    m_mysql = mysql_init(NULL);
+    // 参数：句柄, 地址, 用户名, 密码, 数据库名, 端口, unix_socket, 标志
+    if (!mysql_real_connect(m_mysql, "192.168.56.101", "root_1", "123456Zxj!", "chat_system", 0, NULL, 0)) {
+        log("数据库连接失败: " + std::string(mysql_error(m_mysql)));
+        return false;
+    }
+    log("数据库连接成功");
+    return true;
+}
+
+void EpollChatServer::saveMessageToDB(const std::string& sender, const std::string& target, const std::string& content) {
+    std::lock_guard<std::mutex> lock(m_dbMutex);
+    
+    // 处理特殊字符防止 SQL 注入
+    char* escapedContent = new char[content.length() * 2 + 1];
+    mysql_real_escape_string(m_mysql, escapedContent, content.c_str(), content.length());
+
+    std::string sql = "INSERT INTO all_messages_log (sender, target, content) VALUES ('" 
+                      + sender + "', '" + target + "', '" + escapedContent + "')";
+    
+    if (mysql_query(m_mysql, sql.c_str())) {
+        log("SQL 执行错误: " + std::string(mysql_error(m_mysql)));
+    }
+    
+    delete[] escapedContent;
 }

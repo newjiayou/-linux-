@@ -1,1 +1,0 @@
-/usr/bin/c++  -O3 -Wall CMakeFiles/chatserver.dir/main.cpp.o CMakeFiles/chatserver.dir/EpollChatServer.cpp.o -o chatserver 
