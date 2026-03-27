@@ -6,7 +6,12 @@
 #include <vector>
 #include <unordered_map>
 #include "ThreadPool.h"
-
+#include <memory>
+#include <mutex>
+#include <mysql/mysql.h> // 新增：MySQL 头文件
+#include <chrono>
+#include <iomanip>
+#include <sstream>
 // 客户端连接状态上下文
 struct ClientContext {
     int fd;
@@ -37,16 +42,21 @@ private:
    void log(const std::string& msg);
     void setNonBlocking(int fd);
     std::string extractJsonValue(const std::string& json, const std::string& key);
-
     // Epoll 事件驱动
     void run();
     void handleAccept();
     void handleRead(int fd);
     void handleDisconnect(int fd);
-
+    MYSQL* m_mysql;          // MySQL 连接句柄
+    std::mutex m_dbMutex;    // 保证数据库操作线程安全
     // 业务逻辑与发包机制
     void processPacket(std::shared_ptr<ClientContext> ctx, uint16_t msgType, const std::string& body);
     void sendPacket(int fd, uint16_t type, const std::string& data);
-
+   //---------接入数据库-------------
+    void saveMessageToDB(const std::string& sender, const std::string& target, const std::string& content);
+    bool checkLoginFromDatabase(const std::string& inputUser, const std::string& inputPass);
+    // 初始化数据库连接
+    bool initDB();
+    std::string getServerTimeStr(); 
 };
 #endif // EPOLL_CHAT_SERVER_H
