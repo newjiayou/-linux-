@@ -245,6 +245,18 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
             }
             
             sendPacket(clientFd, 5, "{\"result\":\"success\"}");
+            std::vector<std::string> friends = getFriendListFromDB(username);
+    
+    // 构造 JSON: {"friends":["张三","李四"]}
+    std::string jsonResponse = "{\"friends\":[";
+    for (size_t i = 0; i < friends.size(); ++i) {
+        jsonResponse += "\"" + friends[i] + "\"";
+        if (i < friends.size() - 1) jsonResponse += ",";
+    }
+    jsonResponse += "]}";
+
+    sendPacket(clientFd, 12, jsonResponse);
+            
         } else {
             log("用户 " + username + " 登录失败：凭据错误");
             sendPacket(clientFd, 5, "{\"result\":\"fail\"}");
@@ -342,10 +354,56 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
     jsonResponse += "]";
 
     mysql_stmt_close(stmt);
-
+    log(jsonResponse);
     // 将结果回传给客户端
     sendPacket(ctx->fd, 8, jsonResponse);
     log("增量历史发送完毕，共计消息已打包。");
+}
+   else if (msgType == 9) {
+    std::string targetFriend = extractJsonValue(body, "friend");
+    std::string currentUser = ctx->accountID;
+
+    if (currentUser.empty()) return;
+
+    // 1. 不能添加自己
+    if (targetFriend == currentUser) {
+        sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"不能添加自己为好友\"}");
+    }
+    // 2. 检查目标用户是否存在于 accounts 表中
+    else if (!userExistsInDB(targetFriend)) {
+        sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"该用户不存在\"}");
+    }
+    // 3. 执行添加逻辑
+    else {
+        if (addFriendToDB(currentUser, targetFriend)) {
+            log("用户 " + currentUser + " 添加了好友 " + targetFriend);
+            sendPacket(clientFd, 10, "{\"result\":\"success\",\"friend\":\"" + targetFriend + "\",\"message\":\"添加成功\"}");
+            
+            // 可选：如果对方在线，实时通知对方（被添加了）
+            // handleFriendAddedNotify(targetFriend, currentUser); 
+        } else {
+            sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"已经是好友或系统错误\"}");
+        }
+    }
+}
+
+// --- [新增] 处理获取好友列表请求 ---
+else if (msgType == 11) {
+    std::string currentUser = ctx->accountID;
+    if (currentUser.empty()) return;
+
+    std::vector<std::string> friends = getFriendListFromDB(currentUser);
+    
+    // 构造 JSON: {"friends":["张三","李四"]}
+    std::string jsonResponse = "{\"friends\":[";
+    for (size_t i = 0; i < friends.size(); ++i) {
+        jsonResponse += "\"" + friends[i] + "\"";
+        if (i < friends.size() - 1) jsonResponse += ",";
+    }
+    jsonResponse += "]}";
+
+    sendPacket(clientFd, 12, jsonResponse);
+    log("已向用户 " + currentUser + " 发送好友列表");
 }
 }
 
@@ -520,4 +578,50 @@ bool EpollChatServer::checkLoginFromDatabase(const std::string& inputUser, const
     mysql_stmt_close(stmt);
 
     return authSuccess;
+}
+
+
+bool EpollChatServer::userExistsInDB(const std::string& username) {
+    std::lock_guard<std::mutex> lock(m_dbMutex);
+    std::string sql = "SELECT 1 FROM accounts WHERE username = '" + username + "' LIMIT 1";
+    if (mysql_query(m_mysql, sql.c_str())) return false;
+    MYSQL_RES* res = mysql_store_result(m_mysql);
+    bool exists = (res && mysql_num_rows(res) > 0);
+    mysql_free_result(res);
+    return exists;
+}
+bool EpollChatServer::addFriendToDB(const std::string& user, const std::string& friendName) {
+    std::lock_guard<std::mutex> lock(m_dbMutex);
+    // 使用 IGNORE 防止重复插入报错
+    std::string sql = "INSERT IGNORE INTO friends (user_name, friend_name) VALUES ('" 
+                      + user + "', '" + friendName + "')";
+    
+    if (mysql_query(m_mysql, sql.c_str())) {
+        log("添加好友失败: " + std::string(mysql_error(m_mysql)));
+        return false;
+    }
+    
+    // 如果是双向好友，可以再插一条反向的
+    std::string sqlReverse = "INSERT IGNORE INTO friends (user_name, friend_name) VALUES ('" 
+                             + friendName + "', '" + user + "')";
+    mysql_query(m_mysql, sqlReverse.c_str());
+
+    return mysql_affected_rows(m_mysql) > 0;
+}
+std::vector<std::string> EpollChatServer::getFriendListFromDB(const std::string& username) {
+    std::lock_guard<std::mutex> lock(m_dbMutex);
+    std::vector<std::string> friends;
+    
+    std::string sql = "SELECT friend_name FROM friends WHERE user_name = '" + username + "'";
+    if (mysql_query(m_mysql, sql.c_str())) return friends;
+
+    MYSQL_RES* res = mysql_store_result(m_mysql);
+    if (res) {
+        MYSQL_ROW row;
+        while ((row = mysql_fetch_row(res))) {
+            friends.push_back(row[0]);
+        }
+        mysql_free_result(res);
+    }
+    return friends;
 }

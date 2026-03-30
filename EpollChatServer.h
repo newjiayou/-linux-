@@ -58,5 +58,8 @@ private:
     // 初始化数据库连接
     bool initDB();
     std::string getServerTimeStr(); 
+    bool userExistsInDB(const std::string& username) ;
+    bool addFriendToDB(const std::string& user, const std::string& friendName);
+    std::vector<std::string> getFriendListFromDB(const std::string& username);
 };
 #endif // EPOLL_CHAT_SERVER_H
