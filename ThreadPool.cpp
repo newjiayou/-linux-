@@ -1,8 +1,12 @@
 #include "ThreadPool.h"
+#include <mysql/mysql.h> // mysql_thread_init/end for per-thread MySQL C API init
 
 ThreadPool::ThreadPool(size_t threads) : stop(false) {
     for(size_t i = 0; i < threads; ++i)
         workers.emplace_back([this] {
+            // MySQL C API: each native thread should call init/end.
+            // Without this, concurrent DB operations may degrade or behave incorrectly.
+            mysql_thread_init();
             for(;;) {
                 std::function<void()> task;
                 {
@@ -14,6 +18,7 @@ ThreadPool::ThreadPool(size_t threads) : stop(false) {
                 }
                 task();
             }
+            mysql_thread_end(); // reached only if the loop exits via return
         });
 }
 
@@ -29,4 +34,9 @@ ThreadPool::~ThreadPool() {
     { std::unique_lock<std::mutex> lock(queue_mutex); stop = true; }
     condition.notify_all();
     for(std::thread &worker: workers) worker.join();
+}
+
+int ThreadPool::get_size()
+{
+    return workers.size();
 }

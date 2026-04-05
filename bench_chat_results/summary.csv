@@ -1,0 +1,14 @@
+round,connections,target_send_rate,duration,connections_observed,messages_sent,messages_received,send_rate_actual,recv_rate_actual,connect_errors,other_errors,disconnects,notes,raw_file
+1,100,100,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_1_c100_r100.log
+2,100,500,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_2_c100_r500.log
+3,100,1000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_3_c100_r1000.log
+4,100,2000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_4_c100_r2000.log
+5,100,5000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_5_c100_r5000.log
+6,500,100,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_6_c500_r100.log
+7,500,500,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_7_c500_r500.log
+8,500,1000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_8_c500_r1000.log
+9,500,2000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_9_c500_r2000.log
+10,500,5000,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_10_c500_r5000.log
+11,1000,100,60s,0,0,0,0.00,0.00,0,0,0,ok,./bench_chat_results/raw/round_11_c1000_r100.log
+12,1000,500,60s,0,0,0,0.00,0.00,0,0,0,tcpkali_exit_1,./bench_chat_results/raw/round_12_c1000_r500.log
+13,1000,1000,60s,0,0,0,0.00,0.00,0,0,0,tcpkali_exit_1,./bench_chat_results/raw/round_13_c1000_r1000.log
