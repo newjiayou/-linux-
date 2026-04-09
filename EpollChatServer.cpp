@@ -9,9 +9,12 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <atomic>
+#include "MemoryPool.h"
 
 #define MAX_EVENTS 1024
 #define READ_BUFFER_SIZE 4096
+#define MAX_PACKET_SIZE (1024 * 1024)
+#define MAX_PENDING_SEND_BUFFER (4 * 1024 * 1024)
 
 // ---- 统计用原子计数器：帮助定位卡在哪个阶段 ----
 static std::atomic<long> g_acceptCount{0};     // 成功 accept 的连接数
@@ -21,6 +24,29 @@ static std::atomic<long> g_loginDB{0};         // 执行到 DB 查询阶段的�
 static std::atomic<long> g_loginOk{0};         // 登录成功发送前的次数
 static std::atomic<long> g_loginFail{0};       // 登录失败发送前的次数
 static std::atomic<long> g_sendCalled{0};      // sendPacket 被调用的总次数
+static std::atomic<long> g_backpressureDrop{0}; // 因发送积压过大而断开的次数
+
+// V2 内存池封装：用于在服务器里安全地申请/释放临时内存
+class PoolBuffer {
+public:
+    explicit PoolBuffer(size_t size)
+        : m_size(size), m_ptr(Kama_memoryPool::MemoryPool::allocate(size)) {}
+
+    ~PoolBuffer() {
+        if (m_ptr) {
+            Kama_memoryPool::MemoryPool::deallocate(m_ptr, m_size);
+        }
+    }
+
+    PoolBuffer(const PoolBuffer&) = delete;
+    PoolBuffer& operator=(const PoolBuffer&) = delete;
+
+    void* data() { return m_ptr; }
+
+private:
+    size_t m_size;
+    void* m_ptr;
+};
 
 SubReactor::SubReactor(EpollChatServer* server) : m_server(server) {
     m_epollFd = epoll_create1(0);
@@ -42,11 +68,13 @@ SubReactor::~SubReactor() {
     }
 }
 
-void SubReactor::addFd(int fd) {
+void SubReactor::addFd(const std::shared_ptr<ClientContext>& ctx) {
+    ctx->reactorEpollFd = m_epollFd;
+
     struct epoll_event event{};
-    event.data.fd = fd;
+    event.data.fd = ctx->fd;
     event.events = EPOLLIN | EPOLLET;
-    epoll_ctl(m_epollFd, EPOLL_CTL_ADD, fd, &event);
+    epoll_ctl(m_epollFd, EPOLL_CTL_ADD, ctx->fd, &event);
 }
 
 
@@ -56,12 +84,22 @@ void SubReactor::run() {
         int numEvents = epoll_wait(m_epollFd, events, MAX_EVENTS, -1);
         for (int i = 0; i < numEvents; i++) {
             int fd = events[i].data.fd;
+            if (fd <= 0) continue;
+
+            std::shared_ptr<ClientContext> ctx;
+            {
+                std::lock_guard<std::mutex> lock(m_server->m_mapMutex);
+                auto it = m_server->m_clients.find(fd);
+                if (it == m_server->m_clients.end()) {
+                    continue;
+                }
+                ctx = it->second;
+            }
+
             uint32_t ev = events[i].events;
 
-            // 注意：这里不再有 m_listenFd 的判断，因为子 Reactor 不处理 accept
-            
-            if (ev & EPOLLIN) m_server->handleRead(fd);
-            if (ev & EPOLLOUT) m_server->handleWrite(fd);
+            if (ev & EPOLLIN) m_server->handleRead(ctx);
+            if (ev & EPOLLOUT) m_server->handleWrite(ctx);
             if (ev & (EPOLLERR | EPOLLHUP)) m_server->handleDisconnect(fd);
         }
     }
@@ -82,10 +120,6 @@ EpollChatServer::~EpollChatServer() {
     m_subReactors.clear(); 
     if (m_listenFd != -1) close(m_listenFd);
     if (m_epollFd != -1) close(m_epollFd);
-    if (m_redisCtx) {
-        redisFree(m_redisCtx);
-        m_redisCtx = nullptr;
-    }
     std::lock_guard<std::mutex> lock(m_mapMutex);
     for (auto& pair : m_clients) {
         close(pair.first);
@@ -180,6 +214,7 @@ void EpollChatServer::run() {
                       << " login_ok=" << g_loginOk.load()
                       << " login_fail=" << g_loginFail.load()
                       << " send_calls=" << g_sendCalled.load()
+                      << " backpressure_drop=" << g_backpressureDrop.load()
                       << std::endl;
         }
     }
@@ -206,15 +241,6 @@ void EpollChatServer::handleAccept() {
         int one = 1;
         setsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-        if (!m_subReactors.empty()) {
-            size_t index = m_nextSubReactor.fetch_add(1) % m_subReactors.size();
-            m_subReactors[index]->addFd(clientFd);
-        } else {
-            // 如果没有子 Reactor（不应该发生），作为备用直接关闭
-            close(clientFd);
-            continue;
-        }
-
         auto ctx = std::make_shared<ClientContext>();
         ctx->fd = clientFd;
         ctx->ip = inet_ntoa(clientAddr.sin_addr);
@@ -224,21 +250,29 @@ void EpollChatServer::handleAccept() {
             m_clients[clientFd] = ctx;
         }
 
+        if (!m_subReactors.empty()) {
+            size_t index = m_nextSubReactor.fetch_add(1) % m_subReactors.size();
+            m_subReactors[index]->addFd(ctx);
+        } else {
+            // 如果没有子 Reactor（不应该发生），作为备用直接关闭
+            {
+                std::lock_guard<std::mutex> lock(m_mapMutex);
+                m_clients.erase(clientFd);
+            }
+            close(clientFd);
+            continue;
+        }
+
         ++g_acceptCount;
 
         // log("新物理连接: " + ctx->ip + " (fd: " + std::to_string(clientFd) + ")");
     }
 }
 
-void EpollChatServer::handleRead(int fd) {
-    std::shared_ptr<ClientContext> ctx;
-    {
-        std::lock_guard<std::mutex> lock(m_mapMutex);
-        auto it = m_clients.find(fd);
-        if (it != m_clients.end()) ctx = it->second;
-    }
+void EpollChatServer::handleRead(std::shared_ptr<ClientContext> ctx) {
     if (!ctx) return;
 
+    int fd = ctx->fd;
     bool shouldDisconnect = false;
     char buf[READ_BUFFER_SIZE];
 
@@ -249,7 +283,7 @@ void EpollChatServer::handleRead(int fd) {
         if (bytesRead > 0) {
             ++g_readCount;
             std::lock_guard<std::mutex> lock(ctx->clientMutex);
-            ctx->buffer.insert(ctx->buffer.end(), buf, buf + bytesRead);
+            ctx->buffer.append(buf, (size_t)bytesRead);
             continue;
         }
 
@@ -280,6 +314,12 @@ void EpollChatServer::handleRead(int fd) {
             memcpy(&totalLength, ctx->buffer.data(), sizeof(uint32_t));
             totalLength = ntohl(totalLength);
 
+            // 非法包长保护：至少要包含 length(4)+type(2)，且不能无限大
+            if (totalLength < 6 || totalLength > MAX_PACKET_SIZE) {
+                shouldDisconnect = true;
+                break;
+            }
+
             if (ctx->buffer.size() < totalLength) {
                 // 数据还没收全，继续等待
                 break;
@@ -289,7 +329,7 @@ void EpollChatServer::handleRead(int fd) {
             memcpy(&msgType, ctx->buffer.data() + 4, sizeof(uint16_t));
             msgType = ntohs(msgType);
 
-            std::string body((char*)ctx->buffer.data() + 6, totalLength - 6);
+            std::string body((const char*)ctx->buffer.data() + 6, totalLength - 6);
 
             // 丢入线程池异步处理（心跳与聊天消息优先即时处理，减少回包延迟）
             if (msgType == 1 || msgType == 2) {
@@ -301,18 +341,16 @@ void EpollChatServer::handleRead(int fd) {
             }
 
             // 移除已处理数据
-            ctx->buffer.erase(ctx->buffer.begin(), ctx->buffer.begin() + totalLength);
+            ctx->buffer.consume(totalLength);
         }
     }
 }
 
 void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t msgType, const std::string& body) {
-    int clientFd = ctx->fd;
-
     if (msgType == 3) {
         std::string senderID = extractJsonValue(body, "sender");
         if (!senderID.empty()) {
-            setOnlineUser(senderID, clientFd);
+            setOnlineUser(senderID, ctx);
             ctx->accountID = senderID;
             // log("身份识别: " + senderID + " 已绑定 fd: " + std::to_string(clientFd));
         }
@@ -330,22 +368,23 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
 
         if (target == "broadcast") {
             // log("执行广播消息，来源: " + senderID);
-            std::vector<int> targetFds;
+            std::vector<std::shared_ptr<ClientContext>> targets;
             {
                 std::lock_guard<std::mutex> lock(m_mapMutex);
-                for (const auto& pair : m_clients) targetFds.push_back(pair.first);
+                targets.reserve(m_clients.size());
+                for (const auto& pair : m_clients) targets.push_back(pair.second);
             }
-            for (int tFd : targetFds) sendPacket(tFd, 1, enrichedBody);
+            for (const auto& tCtx : targets) sendPacket(tCtx, 1, enrichedBody);
         } else {
-            int targetFd = getOnlineFd(target);
-            
-            if (targetFd != -1) {
-                sendPacket(targetFd, 1, enrichedBody);
-                sendPacket(clientFd, 1, enrichedBody); 
+            std::shared_ptr<ClientContext> targetCtx = getOnlineCtx(target);
+
+            if (targetCtx) {
+                sendPacket(targetCtx, 1, enrichedBody);
+                sendPacket(ctx, 1, enrichedBody);
                 // log("私聊转发: " + senderID + " -> " + target);
             } else {
                 pushOfflineMessage(target, enrichedBody);
-                sendPacket(clientFd, 1, enrichedBody);
+                sendPacket(ctx, 1, enrichedBody);
                 // log("私聊离线存储: " + senderID + " -> " + target);
             }
         }
@@ -357,7 +396,7 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
     }
     else if (msgType == 2) {
         // 心跳回应
-        sendPacket(clientFd, 2, "");
+        sendPacket(ctx, 2, "");
     }
     else if (msgType == 4) {
         ++g_loginIn;
@@ -369,21 +408,21 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
         if (checkLoginFromDatabase(username, password)) {
             ++g_loginOk;
             // log("登录成功: " + username);
-            setOnlineUser(username, clientFd);
+            setOnlineUser(username, ctx);
             ctx->accountID = username;
             
-            sendPacket(clientFd, 5, "{\"result\":\"success\"}");
-            sendPacket(clientFd, 12, getFriendListJson(username));
+            sendPacket(ctx, 5, "{\"result\":\"success\"}");
+            sendPacket(ctx, 12, getFriendListJson(username));
 
             std::vector<std::string> offlineMessages = popOfflineMessages(username);
             for (const auto& msg : offlineMessages) {
-                sendPacket(clientFd, 1, msg);
+                sendPacket(ctx, 1, msg);
             }
             
         } else {
             // log("登录失败: " + username + " 凭据错误");
             ++g_loginFail;
-            sendPacket(clientFd, 5, "{\"result\":\"fail\"}");
+            sendPacket(ctx, 5, "{\"result\":\"fail\"}");
         }
     }
     else if (msgType == 7) {
@@ -443,7 +482,7 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
         }
         jsonResponse += "]";
         mysql_stmt_close(stmt);
-        sendPacket(ctx->fd, 8, jsonResponse);
+        sendPacket(ctx, 8, jsonResponse);
     }
     else if (msgType == 9) {
         std::string targetFriend = extractJsonValue(body, "friend");
@@ -451,83 +490,77 @@ void EpollChatServer::processPacket(std::shared_ptr<ClientContext> ctx, uint16_t
         if (currentUser.empty()) return;
 
         if (targetFriend == currentUser) {
-            sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"不能添加自己\"}");
+            sendPacket(ctx, 10, "{\"result\":\"fail\",\"message\":\"不能添加自己\"}");
         } else if (!userExistsInDB(targetFriend)) {
-            sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"用户不存在\"}");
+            sendPacket(ctx, 10, "{\"result\":\"fail\",\"message\":\"用户不存在\"}");
         } else {
             if (addFriendToDB(currentUser, targetFriend)) {
                 // log(currentUser + " 添加好友 " + targetFriend);
                 invalidateFriendListCache(currentUser);
                 invalidateFriendListCache(targetFriend);
-                sendPacket(clientFd, 10, "{\"result\":\"success\",\"friend\":\"" + targetFriend + "\"}");
+                sendPacket(ctx, 10, "{\"result\":\"success\",\"friend\":\"" + targetFriend + "\"}");
             } else {
-                sendPacket(clientFd, 10, "{\"result\":\"fail\",\"message\":\"已经是好友\"}");
+                sendPacket(ctx, 10, "{\"result\":\"fail\",\"message\":\"已经是好友\"}");
             }
         }
     }
     else if (msgType == 11) {
         std::string currentUser = ctx->accountID;
         if (currentUser.empty()) return;
-        sendPacket(clientFd, 12, getFriendListJson(currentUser));
+        sendPacket(ctx, 12, getFriendListJson(currentUser));
     }
 }
 
-void EpollChatServer::sendPacket(int fd, uint16_t type, const std::string& data) {
+void EpollChatServer::sendPacket(const std::shared_ptr<ClientContext>& ctx, uint16_t type, const std::string& data) {
+    if (!ctx) return;
+
     ++g_sendCalled;
 
+    int fd = ctx->fd;
     uint32_t totalLength = 6 + (uint32_t)data.size();
     uint32_t netLen = htonl(totalLength);
     uint16_t netType = htons(type);
-
-    std::shared_ptr<ClientContext> ctx;
-    {
-        std::lock_guard<std::mutex> mapLock(m_mapMutex);
-        auto it = m_clients.find(fd);
-        if (it == m_clients.end()) return;
-        ctx = it->second;
-    }
 
     bool needEnableWrite = false;
     bool fatalError = false;
     {
         std::lock_guard<std::mutex> sendLock(ctx->sendMutex);
 
-        // 追加到用户态发送缓冲
-        size_t oldSize = ctx->sendBuffer.size();
-        ctx->sendBuffer.resize(oldSize + totalLength);
-        uint8_t* base = ctx->sendBuffer.data() + oldSize;
-        memcpy(base, &netLen, 4);
-        memcpy(base + 4, &netType, 2);
-        if (!data.empty()) memcpy(base + 6, data.data(), data.size());
+        if (ctx->sendBuffer.pendingAfterAppend(totalLength) > MAX_PENDING_SEND_BUFFER) {
+            ++g_backpressureDrop;
+            fatalError = true;
+        } else {
+            // 追加到用户态发送缓冲（V2 内存池托管）
+            size_t oldRemaining = ctx->sendBuffer.remaining();
+            ctx->sendBuffer.append(&netLen, 4);
+            ctx->sendBuffer.append(&netType, 2);
+            if (!data.empty()) ctx->sendBuffer.append(data.data(), data.size());
 
-        // 若当前没有积压数据（sendOffset 正好指向 oldSize），尝试直接写一点
-        if (ctx->sendOffset == oldSize) {
-            while (ctx->sendOffset < ctx->sendBuffer.size()) {
-                const uint8_t* ptr = ctx->sendBuffer.data() + ctx->sendOffset;
-                size_t len = ctx->sendBuffer.size() - ctx->sendOffset;
-                int sent = ::send(fd, ptr, len, 0);
-                if (sent > 0) {
-                    ctx->sendOffset += (size_t)sent;
-                    continue;
-                }
-                if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    needEnableWrite = true;
+            // 若之前没有积压，尝试直接写一点
+            if (oldRemaining == 0) {
+                while (ctx->sendBuffer.remaining() > 0) {
+                    const uint8_t* ptr = ctx->sendBuffer.currentData();
+                    size_t len = ctx->sendBuffer.remaining();
+                    int sent = ::send(fd, ptr, len, MSG_NOSIGNAL);
+                    if (sent > 0) {
+                        ctx->sendBuffer.consume((size_t)sent);
+                        continue;
+                    }
+                    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        needEnableWrite = true;
+                        break;
+                    }
+                    fatalError = true;
                     break;
                 }
-                fatalError = true;
-                break;
-            }
 
-            // 全部写完，清空缓冲
-            if (!fatalError && ctx->sendOffset >= ctx->sendBuffer.size()) {
-                ctx->sendBuffer.clear();
-                ctx->sendOffset = 0;
-            } else if (!fatalError && ctx->sendOffset < ctx->sendBuffer.size()) {
+                if (!fatalError && ctx->sendBuffer.remaining() > 0) {
+                    needEnableWrite = true;
+                }
+            } else {
+                // 有积压：确保 EPOLLOUT 开着
                 needEnableWrite = true;
             }
-        } else {
-            // 有积压：确保 EPOLLOUT 开着
-            needEnableWrite = true;
         }
     }
 
@@ -537,14 +570,17 @@ void EpollChatServer::sendPacket(int fd, uint16_t type, const std::string& data)
     }
 
     if (needEnableWrite) {
-        struct epoll_event ev{};
-        ev.data.fd = fd;
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-        epoll_ctl(m_epollFd, EPOLL_CTL_MOD, fd, &ev);
+        int epollFd = ctx->reactorEpollFd;
+        if (epollFd != -1) {
+            struct epoll_event ev{};
+            ev.data.fd = fd;
+            ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
+            epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
+        }
     }
 }
 
-void EpollChatServer::handleWrite(int fd) {
+void EpollChatServer::sendPacket(int fd, uint16_t type, const std::string& data) {
     std::shared_ptr<ClientContext> ctx;
     {
         std::lock_guard<std::mutex> mapLock(m_mapMutex);
@@ -552,18 +588,24 @@ void EpollChatServer::handleWrite(int fd) {
         if (it == m_clients.end()) return;
         ctx = it->second;
     }
+    sendPacket(ctx, type, data);
+}
 
+void EpollChatServer::handleWrite(std::shared_ptr<ClientContext> ctx) {
+    if (!ctx) return;
+
+    int fd = ctx->fd;
     bool fatalError = false;
     bool done = false;
     {
         std::lock_guard<std::mutex> sendLock(ctx->sendMutex);
 
-        while (ctx->sendOffset < ctx->sendBuffer.size()) {
-            const uint8_t* ptr = ctx->sendBuffer.data() + ctx->sendOffset;
-            size_t len = ctx->sendBuffer.size() - ctx->sendOffset;
-            int sent = ::send(fd, ptr, len, 0);
+        while (ctx->sendBuffer.remaining() > 0) {
+            const uint8_t* ptr = ctx->sendBuffer.currentData();
+            size_t len = ctx->sendBuffer.remaining();
+            int sent = ::send(fd, ptr, len, MSG_NOSIGNAL);
             if (sent > 0) {
-                ctx->sendOffset += (size_t)sent;
+                ctx->sendBuffer.consume((size_t)sent);
                 continue;
             }
             if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -573,9 +615,7 @@ void EpollChatServer::handleWrite(int fd) {
             break;
         }
 
-        if (!fatalError && ctx->sendOffset >= ctx->sendBuffer.size()) {
-            ctx->sendBuffer.clear();
-            ctx->sendOffset = 0;
+        if (!fatalError && ctx->sendBuffer.remaining() == 0) {
             done = true;
         }
     }
@@ -586,27 +626,39 @@ void EpollChatServer::handleWrite(int fd) {
     }
 
     if (done) {
-        struct epoll_event ev{};
-        ev.data.fd = fd;
-        ev.events = EPOLLIN | EPOLLET; // 发完了就关掉 EPOLLOUT，避免空转
-        epoll_ctl(m_epollFd, EPOLL_CTL_MOD, fd, &ev);
+        int epollFd = ctx->reactorEpollFd;
+        if (epollFd != -1) {
+            struct epoll_event ev{};
+            ev.data.fd = fd;
+            ev.events = EPOLLIN | EPOLLET; // 发完了就关掉 EPOLLOUT，避免空转
+            epoll_ctl(epollFd, EPOLL_CTL_MOD, fd, &ev);
+        }
     }
 }
 
 void EpollChatServer::handleDisconnect(int fd) {
+    std::shared_ptr<ClientContext> ctx;
+
     {
         std::lock_guard<std::mutex> lock(m_mapMutex);
         auto it = m_clients.find(fd);
-        if (it != m_clients.end()) {
-            if (!it->second->accountID.empty()) {
-                removeOnlineUser(it->second->accountID);
-                // log("账号 " + it->second->accountID + " 下线");
-            }
-            m_clients.erase(it);
+        if (it == m_clients.end()) return;
+
+        if (!it->second->accountID.empty()) {
+            m_onlineUsers.erase(it->second->accountID);
+            // log("账号 " + it->second->accountID + " 下线");
         }
+
+        int reactorEpollFd = it->second->reactorEpollFd;
+        auto node = m_clients.extract(it);
+        ctx = std::move(node.mapped());
+
+        if (reactorEpollFd != -1) {
+            epoll_ctl(reactorEpollFd, EPOLL_CTL_DEL, fd, nullptr);
+        }
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
     }
-    epoll_ctl(m_epollFd, EPOLL_CTL_DEL, fd, nullptr);
-    close(fd);
 }
 
 bool EpollChatServer::initDB() {
@@ -619,52 +671,44 @@ bool EpollChatServer::initDB() {
 bool EpollChatServer::initRedis() {
     const char* redisHost = std::getenv("REDIS_HOST");
     const char* redisPort = std::getenv("REDIS_PORT");
+    const char* redisPoolSize = std::getenv("REDIS_POOL_SIZE");
 
-    const char* host = redisHost ? redisHost : "127.0.0.1";
+    std::string host = redisHost ? redisHost : "127.0.0.1";
     int port = redisPort ? std::atoi(redisPort) : 6379;
+    int poolSize = redisPoolSize ? std::atoi(redisPoolSize) : 16;
+    if (poolSize <= 0) poolSize = 16;
 
-    m_redisCtx = redisConnect(host, port);
-    if (!m_redisCtx || m_redisCtx->err) {
-        if (m_redisCtx) {
-            // log("Redis 连接失败: " + std::string(m_redisCtx->errstr));
-            redisFree(m_redisCtx);
-            m_redisCtx = nullptr;
-        }
-        return false;
-    }
-
-    return true;
+    auto& pool = RedisConnectionPool::getInstance();
+    pool.configure(host, port, poolSize);
+    return pool.init();
 }
 
-void EpollChatServer::setOnlineUser(const std::string& accountID, int fd) {
-    if (!m_redisCtx || accountID.empty()) return;
+void EpollChatServer::setOnlineUser(const std::string& accountID, const std::shared_ptr<ClientContext>& ctx) {
+    if (accountID.empty() || !ctx) return;
 
-    std::lock_guard<std::mutex> lock(m_redisMutex);
-    redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "HSET chat:online_users %s %d", accountID.c_str(), fd);
-    if (reply) freeReplyObject(reply);
+    std::lock_guard<std::mutex> lock(m_mapMutex);
+    m_onlineUsers[accountID] = ctx;
 }
 
-int EpollChatServer::getOnlineFd(const std::string& accountID) {
-    if (!m_redisCtx || accountID.empty()) return -1;
+std::shared_ptr<ClientContext> EpollChatServer::getOnlineCtx(const std::string& accountID) {
+    if (accountID.empty()) return nullptr;
 
-    std::lock_guard<std::mutex> lock(m_redisMutex);
-    redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "HGET chat:online_users %s", accountID.c_str());
-    if (!reply) return -1;
+    std::lock_guard<std::mutex> lock(m_mapMutex);
+    auto it = m_onlineUsers.find(accountID);
+    if (it == m_onlineUsers.end()) return nullptr;
 
-    int fd = -1;
-    if (reply->type == REDIS_REPLY_STRING) {
-        fd = std::atoi(reply->str);
+    std::shared_ptr<ClientContext> ctx = it->second.lock();
+    if (!ctx) {
+        m_onlineUsers.erase(it);
     }
-    freeReplyObject(reply);
-    return fd;
+    return ctx;
 }
 
 void EpollChatServer::removeOnlineUser(const std::string& accountID) {
-    if (!m_redisCtx || accountID.empty()) return;
+    if (accountID.empty()) return;
 
-    std::lock_guard<std::mutex> lock(m_redisMutex);
-    redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "HDEL chat:online_users %s", accountID.c_str());
-    if (reply) freeReplyObject(reply);
+    std::lock_guard<std::mutex> lock(m_mapMutex);
+    m_onlineUsers.erase(accountID);
 }
 
 std::string EpollChatServer::buildFriendListJson(const std::vector<std::string>& friends) {
@@ -678,64 +722,71 @@ std::string EpollChatServer::buildFriendListJson(const std::vector<std::string>&
 }
 
 std::string EpollChatServer::getFriendListJson(const std::string& username) {
-    if (!m_redisCtx || username.empty()) return buildFriendListJson(getFriendListFromDB(username));
+    if (username.empty()) return buildFriendListJson(getFriendListFromDB(username));
+
+    auto redisConn = RedisConnectionPool::getInstance().getConnection();
+    redisContext* redis = redisConn.get();
+    if (!redis) return buildFriendListJson(getFriendListFromDB(username));
 
     std::string cacheKey = "chat:friends:" + username;
 
-    {
-        std::lock_guard<std::mutex> lock(m_redisMutex);
-        redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "GET %s", cacheKey.c_str());
-        if (reply) {
-            if (reply->type == REDIS_REPLY_STRING) {
-                std::string cached = reply->str;
-                freeReplyObject(reply);
-                return cached;
-            }
+    redisReply* reply = (redisReply*)redisCommand(redis, "GET %s", cacheKey.c_str());
+    if (reply) {
+        if (reply->type == REDIS_REPLY_STRING) {
+            std::string cached = reply->str;
             freeReplyObject(reply);
+            return cached;
         }
+        freeReplyObject(reply);
     }
 
     std::vector<std::string> friends = getFriendListFromDB(username);
     std::string jsonResponse = buildFriendListJson(friends);
 
-    {
-        std::lock_guard<std::mutex> lock(m_redisMutex);
-        redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "SETEX %s %d %s", cacheKey.c_str(), 300, jsonResponse.c_str());
-        if (reply) freeReplyObject(reply);
-    }
+    reply = (redisReply*)redisCommand(redis, "SETEX %s %d %s", cacheKey.c_str(), 300, jsonResponse.c_str());
+    if (reply) freeReplyObject(reply);
 
     return jsonResponse;
 }
 
 void EpollChatServer::invalidateFriendListCache(const std::string& username) {
-    if (!m_redisCtx || username.empty()) return;
-    std::string cacheKey = "chat:friends:" + username;
+    if (username.empty()) return;
 
-    std::lock_guard<std::mutex> lock(m_redisMutex);
-    redisReply* reply = (redisReply*)redisCommand(m_redisCtx, "DEL %s", cacheKey.c_str());
+    auto redisConn = RedisConnectionPool::getInstance().getConnection();
+    redisContext* redis = redisConn.get();
+    if (!redis) return;
+
+    std::string cacheKey = "chat:friends:" + username;
+    redisReply* reply = (redisReply*)redisCommand(redis, "DEL %s", cacheKey.c_str());
     if (reply) freeReplyObject(reply);
 }
 
 void EpollChatServer::pushOfflineMessage(const std::string& targetUser, const std::string& messageJson) {
-    if (!m_redisCtx || targetUser.empty() || messageJson.empty()) return;
+    if (targetUser.empty() || messageJson.empty()) return;
+
+    auto redisConn = RedisConnectionPool::getInstance().getConnection();
+    redisContext* redis = redisConn.get();
+    if (!redis) return;
 
     std::string key = "chat:offline:" + targetUser;
-    std::lock_guard<std::mutex> lock(m_redisMutex);
-    redisReply* pushReply = (redisReply*)redisCommand(m_redisCtx, "RPUSH %s %s", key.c_str(), messageJson.c_str());
+    redisReply* pushReply = (redisReply*)redisCommand(redis, "RPUSH %s %s", key.c_str(), messageJson.c_str());
     if (pushReply) freeReplyObject(pushReply);
 
-    redisReply* expireReply = (redisReply*)redisCommand(m_redisCtx, "EXPIRE %s %d", key.c_str(), 604800);
+    redisReply* expireReply = (redisReply*)redisCommand(redis, "EXPIRE %s %d", key.c_str(), 604800);
     if (expireReply) freeReplyObject(expireReply);
 }
 
 std::vector<std::string> EpollChatServer::popOfflineMessages(const std::string& username) {
     std::vector<std::string> messages;
-    if (!m_redisCtx || username.empty()) return messages;
+    if (username.empty()) return messages;
+
+    auto redisConn = RedisConnectionPool::getInstance().getConnection();
+    redisContext* redis = redisConn.get();
+    if (!redis) return messages;
 
     std::string key = "chat:offline:" + username;
-    std::lock_guard<std::mutex> lock(m_redisMutex);
 
-    redisReply* rangeReply = (redisReply*)redisCommand(m_redisCtx, "LRANGE %s 0 -1", key.c_str());
+    redisReply* rangeReply = (redisReply*)redisCommand(redis, "LRANGE %s 0 -1", key.c_str());
     if (rangeReply) {
         if (rangeReply->type == REDIS_REPLY_ARRAY) {
             for (size_t i = 0; i < rangeReply->elements; ++i) {
@@ -748,7 +799,7 @@ std::vector<std::string> EpollChatServer::popOfflineMessages(const std::string& 
         freeReplyObject(rangeReply);
     }
 
-    redisReply* delReply = (redisReply*)redisCommand(m_redisCtx, "DEL %s", key.c_str());
+    redisReply* delReply = (redisReply*)redisCommand(redis, "DEL %s", key.c_str());
     if (delReply) freeReplyObject(delReply);
 
     return messages;
@@ -757,13 +808,13 @@ std::vector<std::string> EpollChatServer::popOfflineMessages(const std::string& 
 void EpollChatServer::saveMessageToDB(const std::string& sender, const std::string& target, const std::string& content) {
     auto conn_ptr = DBConnectionPool::getInstance().getConnection();
     MYSQL* m_mysql = conn_ptr.get();
-    char* escapedContent = new char[content.length() * 2 + 1];
+    PoolBuffer escapedBuffer(content.length() * 2 + 1);
+    char* escapedContent = static_cast<char*>(escapedBuffer.data());
     mysql_real_escape_string(m_mysql, escapedContent, content.c_str(), content.length());
     std::string sql = "INSERT INTO all_messages_log (sender, target, content) VALUES ('" + sender + "', '" + target + "', '" + escapedContent + "')";
     if (mysql_query(m_mysql, sql.c_str())) {
         // log("SQL错误: " + std::string(mysql_error(m_mysql)));
     }
-    delete[] escapedContent;
 }
 
 std::string EpollChatServer::getServerTimeStr() {

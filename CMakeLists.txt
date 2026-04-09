@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(EpollChatServer CXX)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall")
@@ -17,6 +17,7 @@ pkg_check_modules(HIREDIS REQUIRED hiredis)
 # 头文件路径
 include_directories(${MYSQLCLIENT_INCLUDE_DIRS})
 include_directories(${HIREDIS_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/v2/include)
 
 # 添加可执行文件
 add_executable(chatserver
@@ -24,6 +25,10 @@ add_executable(chatserver
     EpollChatServer.cpp
     ThreadPool.cpp
     DBConnectionPool.cpp
+    RedisConnectionPool.cpp
+    v2/src/CentralCache.cpp
+    v2/src/PageCache.cpp
+    v2/src/ThreadCache.cpp
 )
 
 target_link_libraries(chatserver PRIVATE pthread ${MYSQLCLIENT_LIBRARIES} ${HIREDIS_LIBRARIES})

@@ -1,8 +1,9 @@
 #include "EpollChatServer.h"
 #include <iostream>
 #include <string>
-
+#include <signal.h>
 int main(int argc, char* argv[]) {
+    signal(SIGPIPE, SIG_IGN);
     uint16_t port = 12345;
     if (argc > 1) {
         port = static_cast<uint16_t>(std::stoi(argv[1]));

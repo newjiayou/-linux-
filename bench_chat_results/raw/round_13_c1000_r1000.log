@@ -1,6 +1,0 @@
-WARNING: Not reusing TIME_WAIT sockets, might not open 1000 simultaneous connections. Adjust "/proc/sys/net/ipv4/tcp_tw_reuse" value.
-Destination: [192.168.56.101]:12345
-WARNING: 1000 connections might not be opened at a rate 100 within test duration 60.
-Decrease --connections=1000, or increase --duration=60 or --connect-rate=100.
-Ctrl+C pressed, finishing up...
-Could not create 1000 connections in allotted time (60s)

@@ -9,6 +9,6 @@ bench_chat_results/
 
 # 忽略日志文件
 *.log
-
+Visual Studio Code
 # 如果 scripts 文件夹里有你想忽略的临时数据，可以写成：
 # scripts/*.tmp

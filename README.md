@@ -1,55 +1,200 @@
-EpollChatServer
-这是一个基于 Linux 原生 epoll I/O 多路复用技术实现的轻量级、高性能聊天服务器。它采用了主从反应堆（Reactor）思想的变体：使用单线程 epoll 处理网络事件，并将具体的业务逻辑处理分发到后台线程池，以实现高并发下的低延迟响应。
-核心特性
-高性能 IO：利用 epoll 的边缘触发（ET）或水平触发（LT）特性（当前代码为 LT），能够高效处理大量并发连接。
-线程池处理：将业务逻辑（如 JSON 解析、消息转发、身份绑定）卸载到线程池中，避免阻塞网络主线程。
-粘包处理：自定义二进制协议头（长度 + 类型），确保 TCP 流式传输中的数据包完整性。
-线程安全：通过 std::mutex 对客户端上下文（ClientContext）和全局连接映射进行精细化保护，防止多线程竞争导致的数据竞争。
-多端通信：支持通过 accountID 进行私聊，以及简单的广播模式。
-协议格式
-每个数据包结构如下：
+# linux_server
+
+基于 `epoll + 多线程 + MySQL + Redis` 的高并发聊天服务端（C++17）。
+
+项目核心是一个 Linux 下的 TCP 长连接聊天服务器：
+- 主 Reactor 负责监听并 `accept` 新连接
+- 多个 Sub-Reactor（按 CPU 核心数创建）负责 I/O 读写事件
+- 业务逻辑投递到线程池异步执行
+- MySQL 做持久化（账号、好友、聊天记录）
+- Redis 做缓存与离线消息队列
+- 自研内存池（`v2/`）用于收发缓冲分配，减少频繁 `malloc/free`
+
+---
+
+## 1. 功能概览
+
+- 私聊 / 广播消息
+- 登录鉴权
+- 好友添加与好友列表查询
+- 历史消息同步
+- 离线消息暂存与上线拉取（Redis）
+- 连接池：MySQL 连接池 + Redis 连接池
+- 发送背压保护（发送缓冲过大时断开连接）
+
+---
+
+## 2. 协议说明（当前实现）
+
+每个包格式：
+
 | 字段 | 长度 | 说明 |
-| :--- | :--- | :--- |
-| Length | 4 字节 | 包总长度（包含头部 6 字节） |
-| Type | 2 字节 | 消息类型 (1: 聊天, 2: 心跳, 3: 鉴权) |
-| Body | 变长 | JSON 格式数据 |
-目录结构
-main.cpp: 程序入口。
-EpollChatServer.h/cpp: 服务器核心逻辑，负责 epoll 事件循环、连接管理及业务分发。
-ThreadPool.h/cpp: 基于条件变量和互斥锁实现的任务队列线程池。
-编译指南
-环境要求
-Linux 系统
-支持 C++11 的编译器 (如 GCC/Clang)
-CMake 3.10+
-编译命令
-code
-Bash
-# 在项目根目录下执行
-mkdir build
+|---|---:|---|
+| Length | 4 字节 | 包总长度（含头部）|
+| Type | 2 字节 | 消息类型 |
+| Body | 变长 | JSON 字符串 |
+
+> `Length` 为网络字节序（`htonl/ntohl`），`Type` 为网络字节序（`htons/ntohs`）。
+
+### 已实现消息类型
+
+- `1`：聊天消息（私聊/广播）
+- `2`：心跳
+- `3`：身份绑定（sender -> 当前连接）
+- `4`：登录请求（username/password）
+- `5`：登录结果
+- `7`：历史消息同步请求
+- `8`：历史消息同步响应
+- `9`：添加好友请求
+- `10`：添加好友结果
+- `11`：好友列表请求
+- `12`：好友列表响应
+
+---
+
+## 3. 目录结构
+
+```text
+.
+├─ main.cpp
+├─ EpollChatServer.h / EpollChatServer.cpp   # 服务器核心（Reactor、协议、业务）
+├─ ThreadPool.h / ThreadPool.cpp             # 线程池
+├─ DBConnectionPool.h / DBConnectionPool.cpp # MySQL 连接池
+├─ RedisConnectionPool.h / RedisConnectionPool.cpp # Redis 连接池
+├─ v2/                                        # 自研内存池
+│  ├─ include/
+│  ├─ src/
+│  └─ tests/
+├─ scripts/                                   # 压测、监控、运维脚本
+└─ CMakeLists.txt
+```
+
+---
+
+## 4. 构建与运行
+
+## 依赖
+
+- Linux
+- CMake >= 3.10
+- C++17 编译器（GCC/Clang）
+- `pthread`
+- `pkg-config`
+- `libmysqlclient`（MySQL C API）
+- `hiredis`
+
+Debian/Ubuntu 示例：
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake pkg-config libmysqlclient-dev libhiredis-dev
+```
+
+## 编译
+
+```bash
+mkdir -p build
 cd build
 cmake ..
-make
-运行
-code
-Bash
-# 启动服务器 (默认端口 12345)
-./chatserver [端口号]
-核心技术点
-网络模型：socket -> bind -> listen -> epoll_create -> epoll_wait 事件循环。
-非阻塞 IO：通过 fcntl 将文件描述符设置为 O_NONBLOCK，配合 epoll 处理网络中断。
-并发安全：
-m_mapMutex：保护全局 m_clients 和 m_userMap 的增删查改。
-clientMutex：保护单个客户端的读写缓存，防止分包处理与发送逻辑冲突。
-sendMutex：确保 send 操作的完整性，防止多个线程同时向同一个 fd 发送导致数据错乱。
-TODO / 改进建议
+make -j
+```
 
-边缘触发优化：当前使用 LT 模式，可改为 ET 模式并结合 while(recv) 循环处理。
+产物：`chatserver`
 
-零拷贝优化：在发送数据时，当前采用了 std::vector 复制，未来可考虑使用 sendfile 或缓冲区链表。
+## 运行
 
-心跳检测：引入 Timer 机制，自动清理长时间无心跳（msgType=2）的连接。
+```bash
+./chatserver              # 默认 12345 端口
+# 或
+./chatserver 23456        # 指定端口
+```
 
-更完善的协议：引入 protobuf 或其他序列化库替代原始的字符串解析，提升性能。
-贡献
-欢迎提交 Issue 或 Pull Request，帮助改进该服务器的性能与稳定性。
+---
+
+## 5. 数据源与配置
+
+## MySQL
+
+当前代码中 MySQL 参数在 `EpollChatServer::initDB()` 内写死：
+- host: `192.168.56.101`
+- user: `root_1`
+- password: `123456Zxj!`
+- db: `chat_system`
+- pool size: `20`
+
+如果你的环境不同，请先修改该函数再编译。
+
+## Redis
+
+Redis 支持环境变量（未设置时走默认值）：
+- `REDIS_HOST`（默认 `127.0.0.1`）
+- `REDIS_PORT`（默认 `6379`）
+- `REDIS_POOL_SIZE`（默认 `16`）
+
+示例：
+
+```bash
+export REDIS_HOST=127.0.0.1
+export REDIS_PORT=6379
+export REDIS_POOL_SIZE=32
+./chatserver
+```
+
+---
+
+## 6. 关键实现要点
+
+- `accept4(..., SOCK_NONBLOCK | SOCK_CLOEXEC)`：新连接直接非阻塞
+- `EPOLLET` 边缘触发 + 循环 `recv` 到 `EAGAIN`
+- 每连接独立接收/发送缓冲（基于内存池）
+- 发送路径支持用户态积压 + `EPOLLOUT` 续写
+- 发送积压上限（默认 4MB）防止慢连接拖垮服务
+- 统计计数器周期打印（accept/read/login/send 等）方便压测观测
+
+---
+
+## 7. scripts 脚本说明
+
+`scripts/` 下包含压测与辅助脚本，例如：
+- `bench_chat_latency.py` / `bench_chat.sh`：聊天时延压测
+- `bench_tcpkali_throughput.sh`：吞吐压测
+- `monitor.sh`：运行监控
+- `log_rotate.sh`：日志轮转
+
+> 请根据你的部署路径与环境自行调整脚本中的参数。
+
+---
+
+## 8. v2 内存池
+
+`v2/` 是独立的内存池模块，提供单测与性能测试：
+
+```bash
+cd v2
+mkdir -p build
+cd build
+cmake ..
+make -j
+./unit_test
+./perf_test
+```
+
+---
+
+## 9. 已知注意事项
+
+- 目前 JSON 解析为手写字符串提取（非完整 JSON 解析器）
+- 部分 SQL 语句仍为字符串拼接，生产环境建议统一改为预处理语句
+- `SubReactor` 线程退出流程较简化，生产环境建议增加优雅停机机制
+
+---
+
+## 10. 启动信息
+
+服务启动后会输出类似：
+
+```text
+--- 高性能 epoll 聊天服务端启动 ---
+[LOG] 启动 N 个 I/O 线程 (Sub-Reactors)
+[STATS] accept=... read=... login_in=... login_db=... login_ok=... login_fail=... send_calls=... backpressure_drop=...
+```

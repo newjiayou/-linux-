@@ -1,8 +1,0 @@
-WARNING: Not reusing TIME_WAIT sockets, might not open 100 simultaneous connections. Adjust "/proc/sys/net/ipv4/tcp_tw_reuse" value.
-Destination: [192.168.56.101]:12345
-Ramped up to 100 connections.
-Total data sent:     34.3 MiB (36013440 bytes)
-Total data received: 393.3 MiB (412400836 bytes)
-Bandwidth per channel: 0.598 Mbps, 74.7 kBps
-Aggregate bandwidth: 54.982↓, 4.801↑ Mbps
-Test duration: 60.0052 s.
