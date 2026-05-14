@@ -1,0 +1,35 @@
+
+===== Quick Capacity Start =====
+Mode=private, fixed_qps_per_client=50.0, messages_per_client=200
+SLO: error_rate <= 1.00%, p99 <= 200.00 ms
+
+[RUN] mode=private, clients=4000, qps_per_client=50.0, messages_per_client=200
+
+===== Chat Latency Benchmark Result =====
+Mode                  : private
+Clients               : 4000
+QPS per client        : 50.0
+Messages per client   : 200
+Messages planned total: 800000
+Messages sent         : 799600
+Messages recv         : 789239
+Message loss          : 10361
+Loss rate             : 1.30%
+Duplicate recv        : 0
+Timeout errors        : 10361
+Disconnect events     : 2
+Errors                : 10363
+Error rate            : 1.30%
+Duration (s)          : 98.193
+Avg Latency (ms)      : 2124.162
+P50 Latency (ms)      : 772.219
+P95 Latency (ms)      : 9517.534
+P99 Latency (ms)      : 14271.730
+In throughput (msg/s) : 8143.14
+Out throughput est    : 16286.28 msg/s
+
+[STOP] 当前并发不满足 SLO，快速模式提前停止。
+
+===== Quick Capacity Summary =====
+CSV saved: bench_capacity.csv
+没有任何并发点满足 SLO。

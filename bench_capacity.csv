@@ -1,0 +1,2 @@
+mode,clients,qps,messages,planned,sent,recv,loss,loss_rate,dup_recv,timeout_err,disconnect_events,err,err_rate,duration,avg,p50,p95,p99,in_msgps,out_msgps_est
+private,4000,50.0,200,800000,799600,789239,10361,0.012958,0,10361,2,10363,0.012960,98.193102,2124.162489,772.218934,9517.533844,14271.730032,8143.138222,16286.276444

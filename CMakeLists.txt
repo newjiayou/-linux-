@@ -32,4 +32,5 @@ add_executable(chatserver
 )
 
 target_link_libraries(chatserver PRIVATE pthread ${MYSQLCLIENT_LIBRARIES} ${HIREDIS_LIBRARIES})
+target_link_libraries(chatserver PRIVATE crypto)
 target_include_directories(chatserver PRIVATE ${MYSQLCLIENT_INCLUDE_DIRS} ${HIREDIS_INCLUDE_DIRS})

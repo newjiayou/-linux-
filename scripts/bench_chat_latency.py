@@ -56,6 +56,9 @@ def run_single_client(
 ):
     lat: List[float] = []
     sent = recv_ok = err = 0
+    timeout_err = 0
+    dup_recv = 0
+    disconnect_events = 0
 
     sender_id = f"{sender}_{cid}"
 
@@ -64,7 +67,7 @@ def run_single_client(
         sock.settimeout(0.02)
         sock.connect((host, port))
     except Exception:
-        return {"lat": [], "sent": 0, "recv": 0, "err": messages}
+        return {"lat": [], "sent": 0, "recv": 0, "err": messages, "timeout_err": 0, "dup_recv": 0, "disconnect_events": 1}
 
     # 先做身份绑定（msgType=3），确保私发可命中在线映射
     try:
@@ -139,6 +142,10 @@ def run_single_client(
 
             try:
                 obj = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+
+                # 服务端新增 ACK 回执（同样是 msg_type=1），压测统计时跳过
+                if isinstance(obj, dict) and obj.get("ack") == "ok":
+                    continue
                 m = obj.get("message", "")
                 if isinstance(m, str) and m.startswith(prefix):
                     seq = int(m[len(prefix):])
@@ -146,6 +153,9 @@ def run_single_client(
                     if t0 is not None:
                         lat.append((time.perf_counter_ns() - t0) / 1_000_000.0)
                         recv_ok += 1
+                    else:
+                        # 已经收到过同 seq，再次收到视作疑似重发/重复投递
+                        dup_recv += 1
             except Exception:
                 err += 1
 
@@ -154,8 +164,10 @@ def run_single_client(
         for k in timed_out:
             outstanding.pop(k, None)
             err += 1
+            timeout_err += 1
 
         if disconnected:
+            disconnect_events += 1
             err += len(outstanding)
             outstanding.clear()
             break
@@ -167,13 +179,24 @@ def run_single_client(
     except Exception:
         pass
 
-    return {"lat": lat, "sent": sent, "recv": recv_ok, "err": err}
+    return {
+        "lat": lat,
+        "sent": sent,
+        "recv": recv_ok,
+        "err": err,
+        "timeout_err": timeout_err,
+        "dup_recv": dup_recv,
+        "disconnect_events": disconnect_events,
+    }
 
 
 def run_benchmark(host: str, port: int, messages: int, clients: int, qps: float, timeout_ms: int, sender: str, mode: str, bind_wait_ms: int):
     t0 = time.perf_counter()
     all_lat: List[float] = []
     sent = recv = err = 0
+    timeout_err = 0
+    dup_recv = 0
+    disconnect_events = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=clients) as ex:
         futs = [
@@ -186,12 +209,18 @@ def run_benchmark(host: str, port: int, messages: int, clients: int, qps: float,
             sent += r["sent"]
             recv += r["recv"]
             err += r["err"]
+            timeout_err += r["timeout_err"]
+            dup_recv += r["dup_recv"]
+            disconnect_events += r["disconnect_events"]
 
     dt = max(time.perf_counter() - t0, 1e-9)
     avg = (sum(all_lat) / len(all_lat)) if all_lat else 0.0
+    p50 = percentile(all_lat, 0.50)
     p95 = percentile(all_lat, 0.95)
     p99 = percentile(all_lat, 0.99)
     err_rate = (err / sent) if sent > 0 else 1.0
+    loss = max(sent - recv, 0)
+    loss_rate = (loss / sent) if sent > 0 else 1.0
     in_msgps = sent / dt
 
     # 估算出站：
@@ -210,8 +239,14 @@ def run_benchmark(host: str, port: int, messages: int, clients: int, qps: float,
         "recv": recv,
         "err": err,
         "err_rate": err_rate,
+        "loss": loss,
+        "loss_rate": loss_rate,
+        "timeout_err": timeout_err,
+        "dup_recv": dup_recv,
+        "disconnect_events": disconnect_events,
         "duration": dt,
         "avg": avg,
+        "p50": p50,
         "p95": p95,
         "p99": p99,
         "in_msgps": in_msgps,
@@ -228,10 +263,16 @@ def print_result(r):
     print(f"Messages planned total: {r['planned']}")
     print(f"Messages sent         : {r['sent']}")
     print(f"Messages recv         : {r['recv']}")
+    print(f"Message loss          : {r['loss']}")
+    print(f"Loss rate             : {r['loss_rate'] * 100:.2f}%")
+    print(f"Duplicate recv        : {r['dup_recv']}")
+    print(f"Timeout errors        : {r['timeout_err']}")
+    print(f"Disconnect events     : {r['disconnect_events']}")
     print(f"Errors                : {r['err']}")
     print(f"Error rate            : {r['err_rate'] * 100:.2f}%")
     print(f"Duration (s)          : {r['duration']:.3f}")
     print(f"Avg Latency (ms)      : {r['avg']:.3f}")
+    print(f"P50 Latency (ms)      : {r['p50']:.3f}")
     print(f"P95 Latency (ms)      : {r['p95']:.3f}")
     print(f"P99 Latency (ms)      : {r['p99']:.3f}")
     print(f"In throughput (msg/s) : {r['in_msgps']:.2f}")
@@ -249,11 +290,12 @@ def pick_capacity(rows: List[dict], max_err: float, max_p99: float) -> Optional[
 def write_rows_csv(path: str, rows: List[dict]):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["mode", "clients", "qps", "messages", "planned", "sent", "recv", "err", "err_rate", "duration", "avg", "p95", "p99", "in_msgps", "out_msgps_est"])
+        w.writerow(["mode", "clients", "qps", "messages", "planned", "sent", "recv", "loss", "loss_rate", "dup_recv", "timeout_err", "disconnect_events", "err", "err_rate", "duration", "avg", "p50", "p95", "p99", "in_msgps", "out_msgps_est"])
         for r in rows:
             w.writerow([
-                r["mode"], r["clients"], r["qps"], r["messages"], r["planned"], r["sent"], r["recv"], r["err"],
-                f"{r['err_rate']:.6f}", f"{r['duration']:.6f}", f"{r['avg']:.6f}", f"{r['p95']:.6f}", f"{r['p99']:.6f}",
+                r["mode"], r["clients"], r["qps"], r["messages"], r["planned"], r["sent"], r["recv"],
+                r["loss"], f"{r['loss_rate']:.6f}", r["dup_recv"], r["timeout_err"], r["disconnect_events"], r["err"],
+                f"{r['err_rate']:.6f}", f"{r['duration']:.6f}", f"{r['avg']:.6f}", f"{r['p50']:.6f}", f"{r['p95']:.6f}", f"{r['p99']:.6f}",
                 f"{r['in_msgps']:.6f}", f"{r['out_msgps_est']:.6f}"
             ])
 

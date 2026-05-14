@@ -8,16 +8,66 @@ OUT_DIR="${4:-./bench_chat_results}"
 DURATION="${DURATION:-60s}"
 CONNECTION_LEVELS=(${CONNECTION_LEVELS:-100 500 1000})
 RATE_LEVELS=(${RATE_LEVELS:-100 500 1000 2000 5000})
+AUTO_CLEAN_PORT="${AUTO_CLEAN_PORT:-0}"
 
 mkdir -p "$OUT_DIR"
 RAW_DIR="$OUT_DIR/raw"
 mkdir -p "$RAW_DIR"
 SUMMARY_FILE="$OUT_DIR/summary.csv"
 
+is_local_host() {
+    [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "0.0.0.0" ]]
+}
+
+port_listen_pids() {
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -n tcp "$PORT" 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u
+    else
+        ss -ltnp "( sport = :$PORT )" 2>/dev/null | sed -n '2,$p' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u
+    fi
+}
+
+cleanup_local_port_if_needed() {
+    if ! is_local_host; then
+        return 0
+    fi
+
+    mapfile -t pids < <(port_listen_pids)
+    if (( ${#pids[@]} == 0 )); then
+        return 0
+    fi
+
+    echo "[WARN] 检测到本机端口 $PORT 已被占用，PID: ${pids[*]}"
+    if [[ "$AUTO_CLEAN_PORT" != "1" ]]; then
+        echo "[ERROR] 端口占用会导致你首轮压测失败。"
+        echo "[HINT] 先手工释放端口，或加 AUTO_CLEAN_PORT=1 让脚本自动清理。"
+        exit 1
+    fi
+
+    echo "[INFO] AUTO_CLEAN_PORT=1，开始清理占用端口的进程"
+    for pid in "${pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+
+    for _ in {1..30}; do
+        mapfile -t left < <(port_listen_pids)
+        if (( ${#left[@]} == 0 )); then
+            echo "[INFO] 端口 $PORT 已释放"
+            return 0
+        fi
+        sleep 0.2
+    done
+
+    echo "[ERROR] 端口 $PORT 清理超时，仍被占用: ${left[*]}"
+    exit 1
+}
+
 if ! command -v tcpkali >/dev/null 2>&1; then
     echo "[ERROR] tcpkali 未安装，请先安装 tcpkali。"
     exit 1
 fi
+
+cleanup_local_port_if_needed
 
 if [[ ! -f "$PACKET_FILE" ]]; then
     echo "[ERROR] 压测报文文件不存在: $PACKET_FILE"
